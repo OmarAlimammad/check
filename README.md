@@ -29,7 +29,7 @@ only handles picking the problem, feeding the samples in, and diffing.
 ## Install
 
 ```
-git clone https://github.com/USER/check.git
+git clone https://github.com/OmarAlimammad/check.git
 cd check
 ./install.sh
 ```

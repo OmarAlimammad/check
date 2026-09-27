@@ -1,8 +1,7 @@
 # check
 
-> Built around one person's Hyprland + zsh + clang setup. The shell helpers
-> are plain POSIX `sh` and work from bash or zsh, but on Ubuntu/macOS you will
-> likely need to adapt the autostart step (a `systemd --user` service or
+> Built around one person's Hyprland + zsh + clang setup. Nothing depends on
+> the shell, but on Ubuntu/macOS you will likely need to adapt the autostart step (a `systemd --user` service or
 > launchd instead of Hyprland's `exec-once`), see
 > [Competitive Companion setup](#competitive-companion-setup).
 
@@ -24,7 +23,7 @@ AtCoder, CSES, Kattis, HackerRank and 100+ others. Problem selection goes by
 the problem's name, so nothing depends on Codeforces URL patterns.
 
 Compiling and running are **not** reimplemented; `check` shells out to the
-`run - <file>` helper from [`cp.sh`](#the-cpsh-helpers) for every sample and
+[`run - <file>`](#the-build-and-run-helpers) helper for every sample and
 only handles picking the problem, feeding the samples in, and diffing.
 
 ## Install
@@ -36,21 +35,17 @@ cd check
 ```
 
 - **Requirements:** Python 3 (standard library only, so `requirements.txt`
-  is intentionally empty and there is nothing to `pip install`), a POSIX
-  `sh`, and a C++ compiler. `cp.sh` compiles with `$CXX`, default `c++`.
-- **`install.sh`** symlinks `check` into `~/.local/bin` (or into `$PREFIX` if
-  set: `PREFIX=/usr/local/bin ./install.sh`) and prints the remaining steps.
-  To do it by hand: `ln -s "$PWD/check" ~/.local/bin/check`. Make sure that
-  directory is on your `PATH`.
-- **`cp.sh`** is found automatically: `check` follows its own symlink back to
-  the checkout and sources the `cp.sh` next to it. Set `$CHECK_CP_SH` to use a
-  different file. You only need to source it yourself to use `build`/`run` by
-  hand. Add this to `~/.bashrc` or `~/.zshrc`:
-
-  ```
-  . /path/to/check/cp.sh
-  ```
-
+  is intentionally empty and there is nothing to `pip install`) and a C++
+  compiler. `build` compiles with `$CXX`, default `c++`.
+- **`install.sh`** symlinks `check`, `build` and `run` into `~/.local/bin` (or
+  into `$PREFIX` if set: `PREFIX=/usr/local/bin ./install.sh`) and prints the
+  remaining steps. To do it by hand:
+  `for c in check build run; do ln -s "$PWD/$c" ~/.local/bin/$c; done`.
+  Make sure that directory is on your `PATH`.
+- **`build` and `run`** are installed on `PATH` the same way `check` is, so
+  there is nothing to source: type them directly (`build a.cpp`,
+  `run - a.cpp`). Keep them as symlinks into the checkout; they load
+  `cp_build.py` from beside their real location.
 - Then install the browser extension and start the listener, see below.
 
 ## Competitive Companion setup
@@ -201,7 +196,7 @@ It is a wall-clock limit, and samples run at the same time on shared cores, so a
 solution genuinely close to the limit can measure slower than it would alone.
 `--jobs 1` gives it the machine to itself.
 
-`build` compiles without `-O2` (see [the `cp.sh` helpers](#the-cpsh-helpers)),
+`build` compiles without `-O2` (see [the `build` and `run` helpers](#the-build-and-run-helpers)),
 so local timings can run slower than the judge's optimised build.
 
 ### Output
@@ -286,13 +281,12 @@ after a failure or a Ctrl-C, which also kills any sample still running.
 
 ## Requirements
 
-Python 3 and its standard library, nothing else to install, plus a POSIX `sh`
-and a C++ compiler. The Competitive Companion extension goes in the browser;
-see [setup](#competitive-companion-setup).
+Python 3 and its standard library, nothing else to install, plus a C++
+compiler. The Competitive Companion extension goes in the browser; see
+[setup](#competitive-companion-setup).
 
-`check` finds `run`/`build` by looking for them on `PATH` first, then falling
-back to sourcing `cp.sh` in plain `sh`: `$CHECK_CP_SH` if set, otherwise the
-`cp.sh` next to the real (symlink-resolved) `check` script.
+`check` runs `build` and `run` from `PATH`, where `install.sh` puts them. If
+either is missing it stops and says so.
 
 ## Note on `build`
 
@@ -310,18 +304,19 @@ sample, which is exactly the cost that running them in parallel is meant to
 avoid. `check` copies the binary it just built (and its `.flags` stamp, without
 which `build` assumes the flags changed) into each temp dir, so `build` finds it
 current and the compiler runs once per `check` regardless of the sample count.
-It asks `cp.sh` for that path via `_cp_binpath` rather than hardcoding
+It asks `build --print-path <src>` for that path rather than hardcoding
 `.cache/`, and copies rather than symlinks so a rebuild, if one ever did happen,
 could not have every sample writing the same file at once.
 
-## The `cp.sh` helpers
+## The `build` and `run` helpers
 
-`cp.sh` defines the shell side of this workflow. It is plain POSIX `sh`, so
-it can be sourced from bash, zsh or dash.
+`build` and `run` are the compile-and-run side of this workflow: two small
+executables sharing `cp_build.py`.
 
 | command | what it does |
 | --- | --- |
 | `build [-d] <src...>` | compile to `.cache/<name>`, skipping unchanged sources |
+| `build [-d] --print-path <src>` | print the cached binary's path, without compiling |
 | `run [-] [-d] <src...>` | build, then run — `-` reads stdin from `./input` |
 | `run -d <src>` | build with `-fsanitize=address,undefined` and no optimisation |
 

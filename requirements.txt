@@ -1,2 +1,2 @@
-# Nothing to install: `check` uses only the Python 3 standard library.
-# Outside Python it needs a POSIX `sh` and a C++ compiler ($CXX, default c++).
+# Nothing to install: check, build and run use only the Python 3 standard library.
+# Outside Python they need a C++ compiler ($CXX, default c++).

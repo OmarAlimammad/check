@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""run [-] [-d] <source...> - build, then run; `-` reads stdin from ./input.
+
+The logic lives in cp_build.py, next to this file in the checkout.
+"""
+import os
+import sys
+
+# Installed as a symlink, so look for cp_build beside the real file.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from cp_build import run_main  # noqa: E402
+
+sys.exit(run_main(sys.argv[1:]))

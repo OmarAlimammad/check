@@ -449,36 +449,16 @@ def samples_from(problem: dict) -> list[Sample]:
 # invoking the existing `run` / `build` helpers
 # --------------------------------------------------------------------------
 
-# $CHECK_CP_SH, else the cp.sh shipped next to this script (following the
-# symlink that puts `check` on PATH back to the checkout).
-CP_SH = Path(os.environ.get("CHECK_CP_SH")
-             or Path(__file__).resolve().with_name("cp.sh")).expanduser().resolve()
-
-
-def sourced_cmd(func: str, args: list[str]) -> list[str]:
-    """A command that sources cp.sh in plain `sh` and calls one of its functions.
-
-    Passing the path and arguments as positional parameters rather than pasting
-    them into the script avoids any quoting. Sourcing just cp.sh (rather than
-    starting an interactive shell) keeps startup free of prompt/plugin noise
-    that would otherwise pollute captured output.
-    """
-    return ["sh", "-c", '. "$0" && "$@"', str(CP_SH), func] + args
-
-
 def helper_cmd(func: str, args: list[str]) -> list[str]:
     """Build a command that invokes `run`/`build`.
 
-    These are shell functions rather than executables, so unless a real `run`
-    binary exists on PATH they have to be sourced from cp.sh.
+    Both are executables that install.sh puts on PATH next to `check`.
     """
     exe = shutil.which(func)
-    if exe:
-        return [exe] + args
-    if not CP_SH.is_file():
-        die(f"`{func}` is not on PATH and {CP_SH} does not exist.\n"
-            "  Point CHECK_CP_SH at the file defining your run/build functions.")
-    return sourced_cmd(func, args)
+    if not exe:
+        die(f"`{func}` not found on PATH - did install.sh run correctly?\n"
+            "  It symlinks check, build and run into ~/.local/bin (or $PREFIX).")
+    return [exe] + args
 
 
 def compile_source(source: str) -> None:
@@ -513,13 +493,11 @@ def cached_binary(source: str) -> Path | None:
     `run` goes through `build`, which caches to a path relative to the *current
     directory*. A sample running in its own temp dir therefore finds no cache
     there and rebuilds - once per sample, which is exactly the cost that running
-    them in parallel is meant to avoid. Asking cp.sh where the binary lives,
-    rather than hardcoding its layout, lets the single up-front build be planted
-    in every temp dir.
+    them in parallel is meant to avoid. Asking `build --print-path` where the
+    binary lives, rather than hardcoding its layout, lets the single up-front
+    build be planted in every temp dir.
     """
-    if shutil.which("run"):
-        return None          # a real `run` executable: cache layout unknown
-    proc = subprocess.run(sourced_cmd("_cp_binpath", ["opt", source]),
+    proc = subprocess.run(helper_cmd("build", ["--print-path", source]),
                           capture_output=True, text=True)
     if proc.returncode != 0:
         return None
@@ -617,9 +595,10 @@ def run_sample(source: str, sample: Sample, timeout: float,
     started = time.perf_counter()
     timed_out = False
 
-    # start_new_session puts the wrapper shell and the compiled binary it
-    # spawns into their own process group. Killing only the shell on timeout
-    # would leave the solution running as an orphan - an infinite loop in a
+    # start_new_session puts `run` and anything it spawns (the compiler, or a
+    # solution under a `run` that doesn't exec it) into their own process
+    # group. Killing only `run` on timeout could leave the solution running as
+    # an orphan - an infinite loop in a
     # submission would then spin a core until the machine is rebooted.
     proc = subprocess.Popen(helper_cmd("run", ["-", source]), cwd=workdir,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -783,8 +762,9 @@ def run_raw(source: str, silent: bool) -> int:
     after = resource.getrusage(resource.RUSAGE_CHILDREN)
     cpu = (after.ru_utime + after.ru_stime) - (before.ru_utime + before.ru_stime)
 
-    # Run directly, a signal death is a negative rc; under the `run` wrapper
-    # shell it is 128+N. SIGKILL only counts when the CPU limit explains it.
+    # Run directly (or exec'd by `run`), a signal death is a negative rc; under
+    # a `run` that wraps it in a shell it is 128+N. SIGKILL only counts when
+    # the CPU limit explains it.
     sig = -rc if rc < 0 else rc - 128 if binary is None and rc > 128 else 0
     if sig == signal.SIGXCPU or (sig == signal.SIGKILL
                                  and cpu >= RAW_CPU_LIMIT - 0.1):

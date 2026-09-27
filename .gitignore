@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+
+# cp.sh build cache (and a stray one, if you ever pointed XDG_CACHE_HOME here)
+.cache/
+
+# scratch files from trying things out in the checkout
+/input
+/*.cpp
+
+# editors / OS
+*.swp
+*.swo
+*~
+.*.sw?
+.DS_Store

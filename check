@@ -1,0 +1,916 @@
+#!/usr/bin/env python3
+"""check - run a problem's sample tests against a solution.
+
+Problems come from the Competitive Companion browser extension. `check listen`
+runs a small HTTP server that the extension POSTs each parsed problem to, and
+caches it under ~/.cache/check/companion/. `check <source>` only reads that
+cache - it makes no network connections of its own - then feeds each sample to
+the existing `run - <file>` helper and diffs the result.
+
+Samples run concurrently, each in its own temp directory, because `run -` reads
+its input from a fixed ./input file that they would otherwise fight over.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import errno
+import http.server
+import json
+import os
+import re
+import resource
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import urlsplit
+
+
+# --------------------------------------------------------------------------
+# terminal colours
+# --------------------------------------------------------------------------
+
+class C:
+    enabled = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+    @classmethod
+    def _w(cls, code: str, s: str) -> str:
+        return f"\033[{code}m{s}\033[0m" if cls.enabled else s
+
+    @classmethod
+    def red(cls, s):    return cls._w("31", s)
+    @classmethod
+    def green(cls, s):  return cls._w("32", s)
+    @classmethod
+    def yellow(cls, s): return cls._w("33", s)
+    @classmethod
+    def blue(cls, s):   return cls._w("34", s)
+    @classmethod
+    def dim(cls, s):    return cls._w("2", s)
+    @classmethod
+    def bold(cls, s):   return cls._w("1", s)
+
+
+def warn(msg: str) -> None:
+    print(f"{C.yellow('warning:')} {msg}", file=sys.stderr)
+
+
+def die(msg: str, code: int = 2):
+    print(f"{C.red('check:')} {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# --------------------------------------------------------------------------
+# Competitive Companion cache
+# --------------------------------------------------------------------------
+
+DEFAULT_PORT = 10042
+# The listener deletes cached problems older than this whenever it writes.
+CACHE_TTL = 24 * 60 * 60
+# A batch still missing problems after this long is cached with what did
+# arrive, rather than held forever for a POST that is never coming.
+BATCH_TIMEOUT = 60
+MAX_BODY = 64 * 1024 * 1024
+
+NO_PROBLEM_HELP = ("no problem received yet — open the problem, click "
+                   "Competitive Companion, and make sure `check listen` is running")
+
+# taskClass becomes a filename, and the listener takes POSTs from the network,
+# so it is only trusted when it is a plain identifier: no dots, no slashes.
+TASK_CLASS_RE = re.compile(r"^\w{1,100}$")
+
+
+def cache_dir() -> Path:
+    base = os.environ.get("XDG_CACHE_HOME", "")
+    if not os.path.isabs(base):          # the XDG spec says ignore relative paths
+        base = os.path.expanduser("~/.cache")
+    return Path(base) / "check" / "companion"
+
+
+def validate_payload(data) -> tuple[str, str | None, int]:
+    """Check a problem has everything `check` relies on.
+
+    Returns (taskClass, batch id, batch size); a payload without a batch is a
+    batch of one. Raises ValueError naming the first thing wrong.
+    """
+    if not isinstance(data, dict):
+        raise ValueError("body is not a JSON object")
+    if not isinstance(data.get("name"), str) or not data["name"].strip():
+        raise ValueError("missing or empty 'name'")
+    tests = data.get("tests")
+    if not isinstance(tests, list):
+        raise ValueError("missing 'tests' list")
+    for i, test in enumerate(tests, 1):
+        if not (isinstance(test, dict) and isinstance(test.get("input"), str)
+                and isinstance(test.get("output"), str)):
+            raise ValueError(f"tests[{i}] has no string 'input'/'output'")
+    limit = data.get("timeLimit")
+    if isinstance(limit, bool) or not isinstance(limit, (int, float)) or limit < 0:
+        raise ValueError("missing or invalid 'timeLimit'")
+    langs = data.get("languages")
+    java = langs.get("java") if isinstance(langs, dict) else None
+    task = java.get("taskClass") if isinstance(java, dict) else None
+    if not isinstance(task, str) or not task:
+        raise ValueError("missing 'languages.java.taskClass'")
+    if not TASK_CLASS_RE.match(task):
+        raise ValueError(f"taskClass {task!r} is not a plain identifier")
+
+    batch = data.get("batch")
+    if batch is None:
+        return task, None, 1
+    if not isinstance(batch, dict):
+        raise ValueError("'batch' is not an object")
+    batch_id, size = batch.get("id"), batch.get("size")
+    if not isinstance(batch_id, str) or not batch_id:
+        raise ValueError("missing 'batch.id'")
+    if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+        raise ValueError("'batch.size' is not a positive integer")
+    return task, batch_id, size
+
+
+def task_class(problem: dict) -> str:
+    return problem["languages"]["java"]["taskClass"]
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    """Write via a temp file and rename, so `check` never reads half a file."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def _received_at(path: Path) -> float:
+    try:
+        when = json.loads(path.read_text()).get("received_at")
+        if isinstance(when, (int, float)) and not isinstance(when, bool):
+            return when
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return time.time()
+
+
+def log(msg: str, err: bool = False) -> None:
+    # flush: the daemon's stdout is often a pipe or a log file, where output
+    # would otherwise sit in a buffer instead of confirming the click.
+    print(f"[companion] {msg}", file=sys.stderr if err else sys.stdout, flush=True)
+
+
+class Listener:
+    """Collects POSTed problems and caches each one once its batch is complete.
+
+    A contest page sends one POST per problem, all sharing a batch id, so
+    nothing from a batch is written until every problem in it has arrived.
+    """
+
+    def __init__(self, directory: Path):
+        self.dir = directory
+        self.lock = threading.Lock()
+        # batch id -> {"size": n, "problems": {taskClass: payload}, "timer": t}
+        self.pending: dict[str, dict] = {}
+
+    def receive(self, data: dict) -> None:
+        """Take one payload; raises ValueError if it is malformed."""
+        task, batch_id, size = validate_payload(data)
+        data["received_at"] = time.time()
+        with self.lock:
+            if batch_id is None or size == 1:
+                self._store([data])
+                return
+            batch = self.pending.get(batch_id)
+            if batch is None:
+                timer = threading.Timer(BATCH_TIMEOUT, self._expire, [batch_id])
+                timer.daemon = True
+                batch = self.pending[batch_id] = {
+                    "size": size, "problems": {}, "timer": timer}
+                timer.start()
+            # Keyed by taskClass so a repeated POST cannot pass for a new problem.
+            batch["problems"][task] = data
+            if len(batch["problems"]) >= batch["size"]:
+                del self.pending[batch_id]
+                batch["timer"].cancel()
+                self._store(list(batch["problems"].values()))
+
+    def _expire(self, batch_id: str) -> None:
+        with self.lock:
+            batch = self.pending.pop(batch_id, None)
+            if batch is None:
+                return
+            log(f"batch {batch_id} still incomplete after {BATCH_TIMEOUT}s "
+                f"({len(batch['problems'])}/{batch['size']} problems); "
+                "caching what arrived", err=True)
+            try:
+                self._store(list(batch["problems"].values()))
+            except OSError as exc:
+                log(f"could not write the cache: {exc}", err=True)
+
+    def _store(self, problems: list[dict]) -> None:
+        """Write each problem, point .last at the final one, prune old ones."""
+        self.dir.mkdir(parents=True, exist_ok=True)
+        for problem in problems:
+            task = task_class(problem)
+            _write_atomic(self.dir / f"{task}.json",
+                          json.dumps(problem, indent=2) + "\n")
+            log(f"cached: {problem['name']} ({task})")
+        _write_atomic(self.dir / ".last", task_class(problems[-1]) + "\n")
+        self._prune()
+
+    def _prune(self) -> None:
+        cutoff = time.time() - CACHE_TTL
+        for path in self.dir.glob("*.json"):
+            if _received_at(path) < cutoff:
+                path.unlink(missing_ok=True)
+
+
+def make_handler(listener: Listener):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        timeout = 30  # seconds; a client that stalls mid-body is dropped
+
+        def _reply(self, code: int, msg: str) -> None:
+            body = (msg + "\n").encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            if code == 405:
+                self.send_header("Allow", "POST")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def _reject(self, code: int, reason: str) -> None:
+            log(f"rejected POST from {self.client_address[0]}: {reason}", err=True)
+            self._reply(code, reason)
+
+        def do_POST(self):
+            if urlsplit(self.path).path != "/":
+                return self._reply(404, "not found")
+            try:
+                length = int(self.headers.get("Content-Length", ""))
+            except ValueError:
+                return self._reject(411, "no Content-Length")
+            if not 0 <= length <= MAX_BODY:
+                return self._reject(413, f"body of {length} bytes is too large")
+            try:
+                listener.receive(json.loads(self.rfile.read(length)))
+            except ValueError as exc:    # bad JSON, bad UTF-8, or a bad payload
+                return self._reject(400, f"malformed problem: {exc}")
+            except Exception as exc:
+                log(f"could not cache problem: {exc}", err=True)
+                return self._reply(500, "could not cache problem")
+            self._reply(200, "ok")
+
+        def _not_allowed(self):
+            self._reply(405, "only POST / is accepted")
+
+        do_GET = do_HEAD = do_PUT = do_PATCH = do_DELETE = _not_allowed
+
+        def log_message(self, format, *args):
+            pass  # one line per cached problem is logged instead
+
+    return Handler
+
+
+def port_from_env() -> int:
+    raw = os.environ.get("CHECK_COMPANION_PORT")
+    if not raw:
+        return DEFAULT_PORT
+    try:
+        return int(raw)
+    except ValueError:
+        die(f"$CHECK_COMPANION_PORT is not a port number: {raw!r}")
+
+
+def listen_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="check listen",
+        description="Receive problems from the Competitive Companion extension "
+                    f"and cache them in {cache_dir()} for `check <source>`.")
+    parser.add_argument("--port", type=int, default=port_from_env(),
+                        help=f"port to listen on (default {DEFAULT_PORT}, "
+                             "or $CHECK_COMPANION_PORT)")
+    args = parser.parse_args(argv)
+    if not 1 <= args.port <= 65535:
+        die(f"--port must be between 1 and 65535, got {args.port}")
+
+    listener = Listener(cache_dir())
+    try:
+        server = http.server.ThreadingHTTPServer(("0.0.0.0", args.port),
+                                                 make_handler(listener))
+    except OSError as exc:
+        hint = ("\n  Is `check listen` (or another Competitive Companion tool) "
+                "already running?" if exc.errno == errno.EADDRINUSE else "")
+        die(f"cannot listen on port {args.port}: {exc.strerror}{hint}")
+
+    log(f"listening on 0.0.0.0:{args.port}, caching to {listener.dir}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
+# --------------------------------------------------------------------------
+# picking a cached problem
+# --------------------------------------------------------------------------
+
+def load_cached(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text())
+        validate_payload(data)
+    except (OSError, ValueError) as exc:
+        die(f"unreadable cache entry {path}: {exc}")
+    return data
+
+
+def last_problem() -> dict:
+    """The problem most recently received, as named by .last."""
+    directory = cache_dir()
+    try:
+        task = (directory / ".last").read_text().strip()
+    except OSError:
+        die(NO_PROBLEM_HELP)
+    path = directory / f"{task}.json"
+    if not TASK_CLASS_RE.match(task) or not path.is_file():
+        die(NO_PROBLEM_HELP)
+    return load_cached(path)
+
+
+def cached_problems() -> list[dict]:
+    problems = []
+    for path in cache_dir().glob("*.json"):
+        try:
+            data = json.loads(path.read_text())
+            validate_payload(data)
+        except (OSError, ValueError) as exc:
+            warn(f"skipping unreadable cache entry {path}: {exc}")
+            continue
+        problems.append(data)
+    return sorted(problems, key=lambda p: (p["name"].casefold(), task_class(p)))
+
+
+def letter_from_filename(source: str) -> str | None:
+    """`a.cpp` -> A, `f2.cpp` -> F2; None for anything not shaped like that."""
+    m = re.match(r"^([A-Za-z]\d?)$", Path(source).stem)
+    return m.group(1).upper() if m else None
+
+
+def _named_after(letter: str, name: str) -> bool:
+    # "F2. Title" (Codeforces), "F2 - Title" (AtCoder).
+    return re.match(rf"{re.escape(letter)}(?:\.|\s+-\s)", name.strip(),
+                    re.IGNORECASE) is not None
+
+
+def _listing(problems: list[dict]) -> str:
+    return "\n".join(f"    {p['name']}  {C.dim(f'({task_class(p)})')}"
+                     for p in problems)
+
+
+def find_problem(query: str, source: str) -> dict:
+    """The one cached problem whose name contains `query`, case-insensitively.
+
+    A source named like `f2.cpp` is a fallback on top of that: it picks the
+    problem named "F2. ..." when the query matched nothing, and settles the
+    choice when the query matched several.
+    """
+    problems = cached_problems()
+    if not problems:
+        die(NO_PROBLEM_HELP)
+
+    needle = query.casefold()
+    matches = [p for p in problems if needle in p["name"].casefold()]
+    letter = letter_from_filename(source)
+    if letter and len(matches) != 1:
+        by_letter = [p for p in matches or problems
+                     if _named_after(letter, p["name"])]
+        if by_letter and not matches and len(by_letter) == 1:
+            warn(f"no cached problem's name contains {query!r}; going by the "
+                 f"filename: {by_letter[0]['name']}")
+        if by_letter:
+            matches = by_letter
+
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        die(f"no cached problem matches {query!r}. Cached problems:\n"
+            + _listing(problems))
+    die(f"{len(matches)} cached problems match {query!r}; be more specific:\n"
+        + _listing(matches))
+
+
+# --------------------------------------------------------------------------
+# samples
+# --------------------------------------------------------------------------
+
+def _normalize(text: str) -> list[str]:
+    """Split into lines, drop trailing whitespace per line and trailing blanks."""
+    lines = [ln.rstrip() for ln in text.replace("\r\n", "\n").split("\n")]
+    while lines and not lines[-1]:
+        lines.pop()
+    return lines
+
+
+class Sample:
+    def __init__(self, index: int, input_text: str, expected: list[str]):
+        self.index = index
+        self.input_text = input_text
+        self.expected = expected
+
+
+def samples_from(problem: dict) -> list[Sample]:
+    samples = []
+    for test in problem["tests"]:
+        # Input goes in verbatim - spacing inside a line can be significant -
+        # just with a final newline, which some readers expect.
+        inp = test["input"].replace("\r\n", "\n")
+        if inp and not inp.endswith("\n"):
+            inp += "\n"
+        samples.append(Sample(len(samples) + 1, inp, _normalize(test["output"])))
+    return samples
+
+
+# --------------------------------------------------------------------------
+# invoking the existing `run` / `build` helpers
+# --------------------------------------------------------------------------
+
+# $CHECK_CP_SH, else the cp.sh shipped next to this script (following the
+# symlink that puts `check` on PATH back to the checkout).
+CP_SH = Path(os.environ.get("CHECK_CP_SH")
+             or Path(__file__).resolve().with_name("cp.sh")).expanduser().resolve()
+
+
+def sourced_cmd(func: str, args: list[str]) -> list[str]:
+    """A command that sources cp.sh in plain `sh` and calls one of its functions.
+
+    Passing the path and arguments as positional parameters rather than pasting
+    them into the script avoids any quoting. Sourcing just cp.sh (rather than
+    starting an interactive shell) keeps startup free of prompt/plugin noise
+    that would otherwise pollute captured output.
+    """
+    return ["sh", "-c", '. "$0" && "$@"', str(CP_SH), func] + args
+
+
+def helper_cmd(func: str, args: list[str]) -> list[str]:
+    """Build a command that invokes `run`/`build`.
+
+    These are shell functions rather than executables, so unless a real `run`
+    binary exists on PATH they have to be sourced from cp.sh.
+    """
+    exe = shutil.which(func)
+    if exe:
+        return [exe] + args
+    if not CP_SH.is_file():
+        die(f"`{func}` is not on PATH and {CP_SH} does not exist.\n"
+            "  Point CHECK_CP_SH at the file defining your run/build functions.")
+    return sourced_cmd(func, args)
+
+
+def compile_source(source: str) -> None:
+    """Compile up-front so a build failure is reported as a build failure.
+
+    Building separately (rather than letting the first sample's `run` do it)
+    keeps a compile error from being presented as a failed diff, and keeps the
+    compiler's output away from the captured stdout/stderr of the samples.
+
+    `build` caches per source file, so this recompiles only when the source has
+    actually changed.
+    """
+    proc = subprocess.run(helper_cmd("build", [source]),
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        print(f"{C.red(C.bold('COMPILE ERROR'))} ({source})\n")
+        sys.stdout.write(proc.stderr or proc.stdout or "(no compiler output)\n")
+        sys.exit(2)
+    if proc.stderr.strip():
+        print(C.yellow("compiler warnings:"))
+        sys.stdout.write(proc.stderr)
+        print()
+
+
+# --------------------------------------------------------------------------
+# isolated per-sample working directories
+# --------------------------------------------------------------------------
+
+def cached_binary(source: str) -> Path | None:
+    """The binary `run` would execute for this source, if it can be located.
+
+    `run` goes through `build`, which caches to a path relative to the *current
+    directory*. A sample running in its own temp dir therefore finds no cache
+    there and rebuilds - once per sample, which is exactly the cost that running
+    them in parallel is meant to avoid. Asking cp.sh where the binary lives,
+    rather than hardcoding its layout, lets the single up-front build be planted
+    in every temp dir.
+    """
+    if shutil.which("run"):
+        return None          # a real `run` executable: cache layout unknown
+    proc = subprocess.run(sourced_cmd("_cp_binpath", ["opt", source]),
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        return None
+    rel = proc.stdout.strip()
+    # An absolute path resolves to the same binary from any directory, so there
+    # is nothing to plant.
+    if not rel or Path(rel).is_absolute():
+        return None
+    path = Path(rel)
+    if not path.is_file():
+        # compile_source has already run, so the binary should be sitting there.
+        warn(f"{path} is missing after the build; "
+             "samples may each compile their own copy")
+        return None
+    return path
+
+
+class Workspace:
+    """Hands each sample a private directory to run in.
+
+    `run -` reads stdin from a file literally named `input` in the current
+    directory. Samples sharing a directory would overwrite each other's input
+    mid-run, so each gets its own dir holding the source, its own `input`, and
+    the already-built binary. The user's own ./input is never touched.
+    """
+
+    def __init__(self, source: str, root: str):
+        self.source = source
+        self.root = Path(root)
+        self.src_abs = Path(source).resolve()
+        # An absolute source argument resolves the same from any directory; a
+        # relative one has to reappear at the same relative path, which also
+        # keeps `build`'s cache key (it contains the argument) identical.
+        self.src_rel = None if Path(source).is_absolute() else Path(source)
+        self.planted: list[Path] = []
+        binary = cached_binary(source)
+        if binary is not None:
+            # The stamp travels with the binary: `build` treats a missing one as
+            # "flags changed" and would rebuild despite the binary being there.
+            stamp = binary.with_name(binary.name + ".flags")
+            self.planted = [f for f in (binary, stamp) if f.is_file()]
+
+    def make(self, sample: Sample) -> Path:
+        d = self.root / f"sample-{sample.index}"
+        d.mkdir()
+        if self.src_rel is not None:
+            dest = d / self.src_rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.symlink_to(self.src_abs)
+        # Copied, not symlinked: were `build` ever to decide on a rebuild,
+        # writing through a symlink would have every sample clobbering the one
+        # shared binary. copy2 preserves mtime, so build still sees it current.
+        for rel in self.planted:
+            dest = d / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(rel, dest)
+        (d / "input").write_text(sample.input_text)
+        return d
+
+
+# --------------------------------------------------------------------------
+# running samples
+# --------------------------------------------------------------------------
+
+@dataclass
+class Result:
+    rc: int
+    out: str
+    err: str
+    elapsed: float
+    timed_out: bool
+
+
+_live_lock = threading.Lock()
+_live: set[subprocess.Popen] = set()
+_cancelled = threading.Event()
+
+
+def cancel_all() -> None:
+    """Kill every in-flight sample.
+
+    Ctrl-C is delivered to the main thread only, so a worker blocked in
+    communicate() never sees it; the main thread has to reach in and kill the
+    processes itself, or shutting the pool down would wait out the full timeout.
+    """
+    _cancelled.set()
+    with _live_lock:
+        procs = list(_live)
+    for proc in procs:
+        _kill_group(proc)
+
+
+def run_sample(source: str, sample: Sample, timeout: float,
+               workdir: Path) -> Result:
+    started = time.perf_counter()
+    timed_out = False
+
+    # start_new_session puts the wrapper shell and the compiled binary it
+    # spawns into their own process group. Killing only the shell on timeout
+    # would leave the solution running as an orphan - an infinite loop in a
+    # submission would then spin a core until the machine is rebooted.
+    proc = subprocess.Popen(helper_cmd("run", ["-", source]), cwd=workdir,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, start_new_session=True)
+    with _live_lock:
+        _live.add(proc)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        rc = proc.returncode
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        rc = -1
+        _kill_group(proc)
+        try:
+            out, err = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+    finally:
+        with _live_lock:
+            _live.discard(proc)
+    return Result(rc, out, err, time.perf_counter() - started, timed_out)
+
+
+def _run_one(source: str, sample: Sample, timeout: float,
+             ws: Workspace) -> Result:
+    if _cancelled.is_set():
+        return Result(-1, "", "", 0.0, False)
+    return run_sample(source, sample, timeout, ws.make(sample))
+
+
+def run_samples(source: str, samples: list[Sample], timeout: float, jobs: int,
+                ws: Workspace):
+    """Run every sample at once, yielding (sample, result) in sample order.
+
+    Ordering is by sample number regardless of which finished first, so the
+    output is identical to running them one at a time: a slow sample 1 delays
+    only the *printing* of the samples behind it, not their execution.
+    """
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+        futures = [pool.submit(_run_one, source, s, timeout, ws)
+                   for s in samples]
+        try:
+            for sample, future in zip(samples, futures):
+                yield sample, future.result()
+        except BaseException:
+            # Ctrl-C, or the caller walking away: kill what is still running,
+            # otherwise leaving this `with` blocks until every sample's timeout
+            # has elapsed.
+            cancel_all()
+            for future in futures:
+                future.cancel()
+            raise
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    """Terminate the whole process group, then make sure it is gone."""
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, PermissionError):
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        for _ in range(20):
+            if proc.poll() is not None:
+                return
+            time.sleep(0.05)
+
+
+# --------------------------------------------------------------------------
+# reporting
+# --------------------------------------------------------------------------
+
+def show_diff(expected: list[str], actual: list[str]) -> None:
+    """Line-by-line diff; differing lines show expected above actual."""
+    print(f"    {C.dim('line')}   {C.green('- expected')} / {C.red('+ actual')}")
+    for i in range(max(len(expected), len(actual))):
+        exp = expected[i] if i < len(expected) else None
+        act = actual[i] if i < len(actual) else None
+        num = f"{i + 1:<5}"
+        if exp == act:
+            print(f"      {C.dim(num)} {C.dim(exp)}")
+        else:
+            exp_s = C.green(f"- {exp}") if exp is not None else C.dim("- <missing>")
+            act_s = C.red(f"+ {act}") if act is not None else C.dim("+ <missing>")
+            print(f"    {C.red('!')} {C.dim(num)} {exp_s}")
+            print(f"      {' ' * 5} {act_s}")
+
+
+def show_stderr(err: str) -> None:
+    label = C.dim("debug output (stderr)")
+    if not err.strip():
+        print(f"    {label}: {C.dim('(empty)')}")
+        return
+    print(f"    {label}:")
+    for line in err.rstrip("\n").split("\n"):
+        print(f"    {C.dim('|')} {line}")
+
+
+def report(sample: Sample, res: Result, timeout: float, silent: bool) -> bool:
+    """Print one sample's verdict, returning whether it passed."""
+    actual = _normalize(res.out)
+    ok = (not res.timed_out) and res.rc == 0 and actual == sample.expected
+    timing = C.dim(f"{res.elapsed * 1000:.0f} ms")
+
+    if res.timed_out:
+        head = C.red(C.bold(f"TIMEOUT  sample {sample.index}"))
+        print(f"{head}  {C.dim(f'exceeded {timeout:g}s')}")
+    elif ok:
+        head = C.green(C.bold(f"PASS  sample {sample.index}"))
+        print(f"{head}  {timing}")
+    else:
+        head = C.red(C.bold(f"FAIL  sample {sample.index}"))
+        extra = "" if res.rc == 0 else C.red(f"  exit status {res.rc}")
+        print(f"{head}  {timing}{extra}")
+
+    if not ok:
+        if not res.timed_out:
+            show_diff(sample.expected, actual)
+        else:
+            print(f"    {C.dim('partial stdout:')} {res.out.strip() or '(none)'}")
+    if not silent:
+        show_stderr(res.err)
+    print()
+    return ok
+
+
+# --------------------------------------------------------------------------
+# raw mode
+# --------------------------------------------------------------------------
+
+RAW_CPU_LIMIT = 5
+
+
+def run_raw(source: str, silent: bool) -> int:
+    """Build, then run the solution once on the terminal, like `run a.cpp`.
+
+    Nothing is piped: stdin/stdout (and stderr, unless silenced) are inherited,
+    so the program is fully interactive. The limit is on CPU time rather than
+    wall-clock, so time spent waiting for the user to type does not count.
+    """
+    compile_source(source)
+    binary = cached_binary(source)
+    cmd = [str(binary.resolve())] if binary else helper_cmd("run", [source])
+
+    def limit_cpu():
+        resource.setrlimit(resource.RLIMIT_CPU, (RAW_CPU_LIMIT, RAW_CPU_LIMIT))
+
+    before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    proc = subprocess.Popen(cmd, preexec_fn=limit_cpu,
+                            stderr=subprocess.DEVNULL if silent else None)
+    try:
+        rc = proc.wait()
+    except KeyboardInterrupt:
+        proc.kill()
+        proc.wait()
+        print(file=sys.stderr)
+        return 130
+    after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu = (after.ru_utime + after.ru_stime) - (before.ru_utime + before.ru_stime)
+
+    # Run directly, a signal death is a negative rc; under the `run` wrapper
+    # shell it is 128+N. SIGKILL only counts when the CPU limit explains it.
+    sig = -rc if rc < 0 else rc - 128 if binary is None and rc > 128 else 0
+    if sig == signal.SIGXCPU or (sig == signal.SIGKILL
+                                 and cpu >= RAW_CPU_LIMIT - 0.1):
+        print(C.red(C.bold(f"TIMEOUT ({RAW_CPU_LIMIT}s CPU)")), file=sys.stderr)
+        return 1
+    return 128 + sig if rc < 0 else rc
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+def main() -> int:
+    if sys.argv[1:2] == ["listen"]:
+        return listen_main(sys.argv[2:])
+
+    parser = argparse.ArgumentParser(
+        prog="check",
+        description="Run a problem's samples against a solution. Problems come "
+                    "from the Competitive Companion extension, received by "
+                    "`check listen`.",
+        epilog="Start the listener with `check listen` "
+               "(see `check listen --help`).")
+    parser.add_argument("source", help="solution source file, e.g. a.cpp")
+    parser.add_argument("--problem", metavar="STRING",
+                        help="pick a cached problem by a case-insensitive "
+                             "substring of its name (default: the one most "
+                             "recently received)")
+    parser.add_argument("--timeout", type=float, default=None,
+                        help="per-sample time limit in seconds "
+                             "(default: the problem's own limit, else 10)")
+    parser.add_argument("-j", "--jobs", type=int, metavar="N", default=None,
+                        help="samples to run at once "
+                             "(default: one per CPU, capped at the sample count)")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="also print the problem's name, URL and group")
+    parser.add_argument("-s", "--silent", action="store_true",
+                        help="don't print the solution's stderr")
+    parser.add_argument("-r", "--raw", action="store_true",
+                        help="skip the samples and run the solution once, "
+                             f"interactively ({RAW_CPU_LIMIT}s CPU limit)")
+    # Flags from the browser-scraping days, kept only to explain their absence.
+    parser.add_argument("--tab", nargs="?", const="", help=argparse.SUPPRESS)
+    parser.add_argument("--port", nargs="?", const="", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+
+    if args.tab is not None:
+        die("--tab was removed: check no longer reads browser tabs.\n"
+            "  Problems come from Competitive Companion via `check listen`; "
+            "choose between cached ones with --problem.")
+    if args.port is not None:
+        die("--port now only applies to `check listen`, the Competitive "
+            "Companion listener.\n"
+            "  `check <source>` reads cached problems and makes no network "
+            "connections.")
+
+    if not Path(args.source).is_file():
+        die(f"no such file: {args.source}")
+    if args.raw:
+        return run_raw(args.source, args.silent)
+    if args.jobs is not None and args.jobs < 1:
+        die(f"--jobs must be at least 1, got {args.jobs}")
+
+    if args.problem is not None:
+        problem = find_problem(args.problem, args.source)
+    else:
+        problem = last_problem()
+
+    if args.verbose:
+        print(f"{C.dim('name:')}  {problem['name']}")
+        print(f"{C.dim('url:')}   {problem.get('url') or '(none)'}")
+        print(f"{C.dim('group:')} {problem.get('group') or '(none)'}")
+
+    if problem.get("interactive"):
+        die(f"{problem['name']}: interactive problem — comparing stdin/stdout "
+            f"samples doesn't apply, run manually with "
+            f"`check {shlex.quote(args.source)} -r`")
+
+    samples = samples_from(problem)
+    if not samples:
+        die(f"{problem['name']} came with no sample tests.")
+
+    # timeLimit is in milliseconds; 0 means the judge didn't state one.
+    problem_limit = problem["timeLimit"] / 1000 or None
+    if args.timeout is not None:
+        timeout, limit_note = args.timeout, "--timeout"
+    elif problem_limit is not None:
+        timeout, limit_note = problem_limit, "problem limit"
+    else:
+        timeout, limit_note = 10.0, "default, problem states none"
+
+    jobs = args.jobs or min(len(samples), os.cpu_count() or 1)
+    jobs = max(1, jobs)
+
+    plural = "" if len(samples) == 1 else "s"
+    note = "" if limit_note == "problem limit" else f" {C.dim(f'({limit_note})')}"
+    print(f"{C.bold(problem['name'])}, {len(samples)} sample{plural}, "
+          f"{C.bold(f'{timeout:g}s')} limit{note}")
+    print()
+
+    compile_source(args.source)
+
+    passed = 0
+    failed = []
+    # The temp root goes away on the way out of this block whatever happens -
+    # a pass, a crash, or a Ctrl-C unwinding through it.
+    with tempfile.TemporaryDirectory(prefix="check-") as root:
+        ws = Workspace(args.source, root)
+        for sample, res in run_samples(args.source, samples, timeout, jobs, ws):
+            if report(sample, res, timeout, args.silent):
+                passed += 1
+            else:
+                failed.append(sample.index)
+
+    total = len(samples)
+    if failed:
+        print(f"{C.red(C.bold(f'{passed}/{total} passed'))} - "
+              f"failed: {', '.join(str(i) for i in failed)}")
+        return 1
+    print(C.green(C.bold(f"{passed}/{total} passed")))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)

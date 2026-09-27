@@ -1,0 +1,2 @@
+# Nothing to install: `check` uses only the Python 3 standard library.
+# Outside Python it needs a POSIX `sh` and a C++ compiler ($CXX, default c++).

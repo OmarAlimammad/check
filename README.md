@@ -1,8 +1,9 @@
 # check
 
-> Built around one person's Hyprland + zsh + clang setup. Nothing depends on
-> the shell, but on Ubuntu/macOS you will likely need to adapt the autostart step (a `systemd --user` service or
-> launchd instead of Hyprland's `exec-once`), see
+> Not tied to any shell, window manager or compiler: `check`, `build` and
+> `run` are standalone Python executables installed by a POSIX `sh` script,
+> and the listener runs as a `systemd --user` service (launchd or any other
+> autostart works too on systems without systemd), see
 > [Competitive Companion setup](#competitive-companion-setup).
 
 Runs a problem's sample tests against a solution. The samples come from the
@@ -71,20 +72,8 @@ It runs in the foreground and prints one line per problem it caches:
 [companion] cached: G. Castle Defense (GCastleDefense)
 ```
 
-To keep it running permanently under Hyprland, start it from
-`~/.config/hypr/hyprland.conf`:
-
-```
-exec-once = check listen
-```
-
-or from a keybind:
-
-```
-bind = SUPER, C, exec, check listen
-```
-
-or as a systemd user service, e.g. `~/.config/systemd/user/check-listen.service`:
+To keep it running permanently, run it as a systemd user service,
+`~/.config/systemd/user/check-listen.service`:
 
 ```
 [Unit]
@@ -92,13 +81,18 @@ Description=Competitive Companion listener for check
 
 [Service]
 ExecStart=%h/.local/bin/check listen
+Restart=on-failure
+RestartSec=2
 
 [Install]
 WantedBy=default.target
 ```
 
 then `systemctl --user enable --now check-listen`, and read its output with
-`journalctl --user -u check-listen -f`.
+`journalctl --user -u check-listen -f`. It starts on login regardless of
+shell, desktop or window manager. (Adjust `ExecStart` if you installed with a
+different `PREFIX`.) Without systemd, e.g. on macOS, use a launchd agent or
+whatever your system uses to start a command at login.
 
 To use another port, pass `check listen --port N` (or set
 `$CHECK_COMPANION_PORT`) and change the port in the extension's settings to match.

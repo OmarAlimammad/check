@@ -131,11 +131,24 @@ curl -X POST localhost:10042/ -d '{"name":"A. Test","tests":[{"input":"1\n","out
 ## Usage
 
 ```
-check <source> [--problem STRING] [--timeout SECONDS] [--jobs N]
+check <src...> [--problem STRING] [--timeout SECONDS] [--jobs N]
                [--verbose] [--silent]
-check <source> --raw [--silent]
+check <src...> --raw [--silent]
 check listen [--port N]
 ```
+
+Flags can go before or after the sources. Give several sources for
+grader-style problems, where the judge's grader and your solution are compiled
+together into one binary:
+
+```
+check grader.cpp sol.cpp
+```
+
+They are passed to `build` and `run` exactly as given, in that order (it can
+matter for linking), never deduplicated or reordered. Everything below applies
+to multi-file use too, and anywhere `check` suggests a command it repeats the
+full list of files.
 
 | flag | meaning |
 | --- | --- |
@@ -178,6 +191,11 @@ counts as a match too. That settles a tie: `check a.cpp --problem sum` takes
 `A. Sum` over `C. Another Sum`. It also acts as a fallback when no name
 contains the string, with a warning saying so. After clicking on a contest's
 all-problems page, `check f2.cpp --problem ''` therefore picks F2.
+
+With several sources, the filename counts only if exactly one of them is
+named like a problem letter: `check a.cpp util.cpp` goes by A, while
+`check grader.cpp sol.cpp` (none) or `check a.cpp b.cpp` (two) skips the
+filename entirely.
 
 ### Time limit
 
@@ -267,8 +285,8 @@ Concurrency is capped at one job per CPU (never more than the sample count), and
 `run -` reads stdin from a file named `input` in the current directory, so
 samples running side by side would overwrite each other's input mid-run.
 
-Each sample therefore gets a private temp directory holding the source, its own
-`input`, and the compiled binary, and `run` is invoked with that as its working
+Each sample therefore gets a private temp directory holding a copy of every
+source, its own `input`, and the compiled binary, and `run` is invoked with that as its working
 directory. Your own `./input` is left exactly as it was — `check` no longer
 writes to it at all. The temp directories are removed on the way out, including
 after a failure or a Ctrl-C, which also kills any sample still running.
@@ -288,9 +306,12 @@ either is missing it stops and says so.
 do it, so a compile error is reported as a compile error instead of a failed
 diff, and compiler output never lands in a sample's captured stderr.
 
-It does **not** force a rebuild. `build` caches one binary per source under
-`.cache/`, so an unchanged solution is not recompiled — a second `check` of the
-same file skips the compiler entirely.
+It does **not** force a rebuild. `build` caches one binary per source (or set
+of sources) under `.cache/`, so an unchanged solution is not recompiled — a
+second `check` of the same files skips the compiler entirely. A change to *any*
+of the sources rebuilds, not just the first, as does changing the flags or
+`$CXX`. `check grader.cpp sol.cpp` builds `.cache/grader+sol`, so it never
+shares a binary with `check grader.cpp` or `check sol.cpp`.
 
 That cache is keyed on a path relative to the *current* directory, so a sample
 running in its own temp dir would find nothing there and rebuild — once per
@@ -298,9 +319,17 @@ sample, which is exactly the cost that running them in parallel is meant to
 avoid. `check` copies the binary it just built (and its `.flags` stamp, without
 which `build` assumes the flags changed) into each temp dir, so `build` finds it
 current and the compiler runs once per `check` regardless of the sample count.
-It asks `build --print-path <src>` for that path rather than hardcoding
+It asks `build --print-path <src...>` for that path rather than hardcoding
 `.cache/`, and copies rather than symlinks so a rebuild, if one ever did happen,
 could not have every sample writing the same file at once.
+
+The sources are copied into each temp dir too, at the same relative paths
+(`sub/grader.cpp` stays `sub/grader.cpp`), so `run` sees the very arguments
+`build` was given. They are copied with their timestamps, so the binary still
+looks newer than every one of them. A source given by absolute path is left
+where it is, since it resolves the same from anywhere. One reaching up with
+`..` (`../lib/util.cpp`) makes the sample run that many directories further
+down inside its temp dir, so the copy still lands inside it.
 
 ## The `build` and `run` helpers
 
@@ -310,7 +339,7 @@ executables sharing `cp_build.py`.
 | command | what it does |
 | --- | --- |
 | `build [-d] <src...>` | compile to `.cache/<name>`, skipping unchanged sources |
-| `build [-d] --print-path <src>` | print the cached binary's path, without compiling |
+| `build [-d] --print-path <src...>` | print the cached binary's path, without compiling |
 | `run [-] [-d] <src...>` | build, then run — `-` reads stdin from `./input` |
 | `run -d <src>` | build with `-fsanitize=address,undefined` and no optimisation |
 
@@ -325,7 +354,11 @@ Add `.cache/` to your global gitignore.
 so a timestamp check couldn't tell the binary came from a *different* source:
 after building `a.cpp`, an older `b.cpp` still looked up to date and `run b.cpp`
 silently ran A's program. Keying the cache on the source name makes that
-impossible, and switching between problems no longer recompiles.
+impossible, and switching between problems no longer recompiles. Several
+sources compiled together are named after all of them, joined with `+`:
+`build grader.cpp sol.cpp` builds `.cache/grader+sol`. Extra compiler flags
+(`build a.cpp -lm`) don't change the name; only arguments naming existing
+files count as sources.
 
 **Compile times** measured on the author's machine, same file:
 

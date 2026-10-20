@@ -22,18 +22,28 @@ def err(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
-def bin_path(source: str, debug: bool) -> str:
-    """The cached binary for a source: .cache/<its filename minus extension>.
+def _stem(path: str) -> str:
+    name = os.path.basename(path)
+    return name[:name.rindex(".")] if "." in name else name
+
+
+def bin_path(args: list[str], debug: bool) -> str:
+    """The cached binary for a build: .cache/<source filename minus extension>.
 
     One binary per source. Everything used to compile to a single ./bin, so a
     timestamp check could not tell the binary came from a *different* source:
     after building a.cpp, an older b.cpp still looked up to date and `run b.cpp`
     silently ran A's program. Keying on the source name fixes that, and
     switching between problems no longer recompiles.
+
+    Several sources compiled together (`build grader.cpp sol.cpp`) get their
+    stems joined with '+', .cache/grader+sol, so they never share a binary with
+    a build of any one of them. Extra compiler flags (`build a.cpp -lm`) are not
+    sources: only arguments naming existing files count, beyond the first.
     """
-    name = os.path.basename(source)
-    if "." in name:
-        name = name[:name.rindex(".")]
+    sources = [args[0]] + [a for a in args[1:]
+                           if not a.startswith("-") and os.path.isfile(a)]
+    name = "+".join(_stem(s) for s in sources)
     return os.path.join(".cache", name + (".dbg" if debug else ""))
 
 
@@ -59,7 +69,7 @@ def _is_current(binary: str, stamp: str, key: str, args: list[str]) -> bool:
 
 
 def build(args: list[str], debug: bool) -> int:
-    """Compile `args` (the first one names the binary) unless already current.
+    """Compile `args` (its sources name the binary) unless already current.
 
     `args` goes to the compiler verbatim, so `build a.cpp -lm` works; it is also
     part of the stamp, as are $CXX and the flags, so changing any of them
@@ -67,7 +77,7 @@ def build(args: list[str], debug: bool) -> int:
     """
     cxx = os.environ.get("CXX") or "c++"
     flags = DEBUG_FLAGS if debug else []
-    binary = bin_path(args[0], debug)
+    binary = bin_path(args, debug)
     stamp = binary + ".flags"
     key = f"{cxx} {' '.join(flags)} -- {' '.join(args)}"
 
@@ -118,7 +128,7 @@ def build_main(argv: list[str]) -> int:
         return 2
 
     if print_path:
-        print(bin_path(argv[0], debug))
+        print(bin_path(argv, debug))
         return 0
     try:
         return build(argv, debug)
@@ -171,7 +181,7 @@ def run_main(argv: list[str]) -> int:
 
     # exec rather than spawn: the solution takes over this process, so its exit
     # status and signals reach the caller untouched and nothing lingers around it.
-    binary = bin_path(argv[0], debug)
+    binary = bin_path(argv, debug)
     try:
         os.execv(binary, [binary])
     except OSError as e:

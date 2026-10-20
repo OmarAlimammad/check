@@ -382,12 +382,13 @@ def _listing(problems: list[dict]) -> str:
                      for p in problems)
 
 
-def find_problem(query: str, source: str) -> dict:
+def find_problem(query: str, sources: list[str]) -> dict:
     """The one cached problem whose name contains `query`, case-insensitively.
 
     A source named like `f2.cpp` is a fallback on top of that: it picks the
     problem named "F2. ..." when the query matched nothing, and settles the
-    choice when the query matched several.
+    choice when the query matched several. With several sources it applies
+    only when exactly one of them is named like that.
     """
     problems = cached_problems()
     if not problems:
@@ -395,7 +396,8 @@ def find_problem(query: str, source: str) -> dict:
 
     needle = query.casefold()
     matches = [p for p in problems if needle in p["name"].casefold()]
-    letter = letter_from_filename(source)
+    letters = [l for l in map(letter_from_filename, sources) if l]
+    letter = letters[0] if len(letters) == 1 else None
     if letter and len(matches) != 1:
         by_letter = [p for p in matches or problems
                      if _named_after(letter, p["name"])]
@@ -461,20 +463,20 @@ def helper_cmd(func: str, args: list[str]) -> list[str]:
     return [exe] + args
 
 
-def compile_source(source: str) -> None:
+def compile_source(sources: list[str]) -> None:
     """Compile up-front so a build failure is reported as a build failure.
 
     Building separately (rather than letting the first sample's `run` do it)
     keeps a compile error from being presented as a failed diff, and keeps the
     compiler's output away from the captured stdout/stderr of the samples.
 
-    `build` caches per source file, so this recompiles only when the source has
-    actually changed.
+    `build` caches per set of source files, so this recompiles only when one
+    of them has actually changed.
     """
-    proc = subprocess.run(helper_cmd("build", [source]),
+    proc = subprocess.run(helper_cmd("build", sources),
                           capture_output=True, text=True)
     if proc.returncode != 0:
-        print(f"{C.red(C.bold('COMPILE ERROR'))} ({source})\n")
+        print(f"{C.red(C.bold('COMPILE ERROR'))} ({' '.join(sources)})\n")
         sys.stdout.write(proc.stderr or proc.stdout or "(no compiler output)\n")
         sys.exit(2)
     if proc.stderr.strip():
@@ -487,8 +489,8 @@ def compile_source(source: str) -> None:
 # isolated per-sample working directories
 # --------------------------------------------------------------------------
 
-def cached_binary(source: str) -> Path | None:
-    """The binary `run` would execute for this source, if it can be located.
+def cached_binary(sources: list[str]) -> Path | None:
+    """The binary `run` would execute for these sources, if it can be located.
 
     `run` goes through `build`, which caches to a path relative to the *current
     directory*. A sample running in its own temp dir therefore finds no cache
@@ -497,7 +499,7 @@ def cached_binary(source: str) -> Path | None:
     binary lives, rather than hardcoding its layout, lets the single up-front
     build be planted in every temp dir.
     """
-    proc = subprocess.run(helper_cmd("build", ["--print-path", source]),
+    proc = subprocess.run(helper_cmd("build", ["--print-path"] + sources),
                           capture_output=True, text=True)
     if proc.returncode != 0:
         return None
@@ -515,25 +517,35 @@ def cached_binary(source: str) -> Path | None:
     return path
 
 
+def _climb(path: str) -> int:
+    """How many levels above its starting dir a relative path reaches."""
+    depth = lowest = 0
+    for part in Path(path).parts:
+        depth += -1 if part == ".." else 1
+        lowest = min(lowest, depth)
+    return -lowest
+
+
 class Workspace:
     """Hands each sample a private directory to run in.
 
     `run -` reads stdin from a file literally named `input` in the current
     directory. Samples sharing a directory would overwrite each other's input
-    mid-run, so each gets its own dir holding the source, its own `input`, and
+    mid-run, so each gets its own dir holding the sources, its own `input`, and
     the already-built binary. The user's own ./input is never touched.
     """
 
-    def __init__(self, source: str, root: str):
-        self.source = source
+    def __init__(self, sources: list[str], root: str):
         self.root = Path(root)
-        self.src_abs = Path(source).resolve()
         # An absolute source argument resolves the same from any directory; a
         # relative one has to reappear at the same relative path, which also
-        # keeps `build`'s cache key (it contains the argument) identical.
-        self.src_rel = None if Path(source).is_absolute() else Path(source)
+        # keeps `build`'s cache key (it contains the arguments) identical.
+        self.src_rel = [Path(s) for s in sources if not Path(s).is_absolute()]
+        # A source like ../lib/util.cpp would land outside the sample's dir, so
+        # the sample runs that many levels further down inside it instead.
+        self.depth = max((_climb(s) for s in self.src_rel), default=0)
         self.planted: list[Path] = []
-        binary = cached_binary(source)
+        binary = cached_binary(sources)
         if binary is not None:
             # The stamp travels with the binary: `build` treats a missing one as
             # "flags changed" and would rebuild despite the binary being there.
@@ -541,16 +553,13 @@ class Workspace:
             self.planted = [f for f in (binary, stamp) if f.is_file()]
 
     def make(self, sample: Sample) -> Path:
-        d = self.root / f"sample-{sample.index}"
-        d.mkdir()
-        if self.src_rel is not None:
-            dest = d / self.src_rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.symlink_to(self.src_abs)
+        d = self.root.joinpath(f"sample-{sample.index}", *["cwd"] * self.depth)
+        d.mkdir(parents=True)
         # Copied, not symlinked: were `build` ever to decide on a rebuild,
         # writing through a symlink would have every sample clobbering the one
-        # shared binary. copy2 preserves mtime, so build still sees it current.
-        for rel in self.planted:
+        # shared binary. copy2 preserves mtime, so build still sees it current,
+        # and still sees every source as older than it.
+        for rel in self.src_rel + self.planted:
             dest = d / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(rel, dest)
@@ -590,7 +599,7 @@ def cancel_all() -> None:
         _kill_group(proc)
 
 
-def run_sample(source: str, sample: Sample, timeout: float,
+def run_sample(sources: list[str], sample: Sample, timeout: float,
                workdir: Path) -> Result:
     started = time.perf_counter()
     timed_out = False
@@ -600,7 +609,7 @@ def run_sample(source: str, sample: Sample, timeout: float,
     # group. Killing only `run` on timeout could leave the solution running as
     # an orphan - an infinite loop in a
     # submission would then spin a core until the machine is rebooted.
-    proc = subprocess.Popen(helper_cmd("run", ["-", source]), cwd=workdir,
+    proc = subprocess.Popen(helper_cmd("run", ["-"] + sources), cwd=workdir,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, start_new_session=True)
     with _live_lock:
@@ -622,15 +631,15 @@ def run_sample(source: str, sample: Sample, timeout: float,
     return Result(rc, out, err, time.perf_counter() - started, timed_out)
 
 
-def _run_one(source: str, sample: Sample, timeout: float,
+def _run_one(sources: list[str], sample: Sample, timeout: float,
              ws: Workspace) -> Result:
     if _cancelled.is_set():
         return Result(-1, "", "", 0.0, False)
-    return run_sample(source, sample, timeout, ws.make(sample))
+    return run_sample(sources, sample, timeout, ws.make(sample))
 
 
-def run_samples(source: str, samples: list[Sample], timeout: float, jobs: int,
-                ws: Workspace):
+def run_samples(sources: list[str], samples: list[Sample], timeout: float,
+                jobs: int, ws: Workspace):
     """Run every sample at once, yielding (sample, result) in sample order.
 
     Ordering is by sample number regardless of which finished first, so the
@@ -638,7 +647,7 @@ def run_samples(source: str, samples: list[Sample], timeout: float, jobs: int,
     only the *printing* of the samples behind it, not their execution.
     """
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
-        futures = [pool.submit(_run_one, source, s, timeout, ws)
+        futures = [pool.submit(_run_one, sources, s, timeout, ws)
                    for s in samples]
         try:
             for sample, future in zip(samples, futures):
@@ -735,16 +744,16 @@ def report(sample: Sample, res: Result, timeout: float, silent: bool) -> bool:
 RAW_CPU_LIMIT = 5
 
 
-def run_raw(source: str, silent: bool) -> int:
+def run_raw(sources: list[str], silent: bool) -> int:
     """Build, then run the solution once on the terminal, like `run a.cpp`.
 
     Nothing is piped: stdin/stdout (and stderr, unless silenced) are inherited,
     so the program is fully interactive. The limit is on CPU time rather than
     wall-clock, so time spent waiting for the user to type does not count.
     """
-    compile_source(source)
-    binary = cached_binary(source)
-    cmd = [str(binary.resolve())] if binary else helper_cmd("run", [source])
+    compile_source(sources)
+    binary = cached_binary(sources)
+    cmd = [str(binary.resolve())] if binary else helper_cmd("run", sources)
 
     def limit_cpu():
         resource.setrlimit(resource.RLIMIT_CPU, (RAW_CPU_LIMIT, RAW_CPU_LIMIT))
@@ -788,7 +797,9 @@ def main() -> int:
                     "`check listen`.",
         epilog="Start the listener with `check listen` "
                "(see `check listen --help`).")
-    parser.add_argument("source", help="solution source file, e.g. a.cpp")
+    parser.add_argument("sources", nargs="+", metavar="source",
+                        help="solution source file, e.g. a.cpp; several "
+                             "(grader.cpp sol.cpp) are compiled together")
     parser.add_argument("--problem", metavar="STRING",
                         help="pick a cached problem by a case-insensitive "
                              "substring of its name (default: the one most "
@@ -821,15 +832,16 @@ def main() -> int:
             "  `check <source>` reads cached problems and makes no network "
             "connections.")
 
-    if not Path(args.source).is_file():
-        die(f"no such file: {args.source}")
+    for source in args.sources:
+        if not Path(source).is_file():
+            die(f"no such file: {source}")
     if args.raw:
-        return run_raw(args.source, args.silent)
+        return run_raw(args.sources, args.silent)
     if args.jobs is not None and args.jobs < 1:
         die(f"--jobs must be at least 1, got {args.jobs}")
 
     if args.problem is not None:
-        problem = find_problem(args.problem, args.source)
+        problem = find_problem(args.problem, args.sources)
     else:
         problem = last_problem()
 
@@ -841,7 +853,7 @@ def main() -> int:
     if problem.get("interactive"):
         die(f"{problem['name']}: interactive problem — comparing stdin/stdout "
             f"samples doesn't apply, run manually with "
-            f"`check {shlex.quote(args.source)} -r`")
+            f"`check {shlex.join(args.sources)} -r`")
 
     samples = samples_from(problem)
     if not samples:
@@ -865,15 +877,16 @@ def main() -> int:
           f"{C.bold(f'{timeout:g}s')} limit{note}")
     print()
 
-    compile_source(args.source)
+    compile_source(args.sources)
 
     passed = 0
     failed = []
     # The temp root goes away on the way out of this block whatever happens -
     # a pass, a crash, or a Ctrl-C unwinding through it.
     with tempfile.TemporaryDirectory(prefix="check-") as root:
-        ws = Workspace(args.source, root)
-        for sample, res in run_samples(args.source, samples, timeout, jobs, ws):
+        ws = Workspace(args.sources, root)
+        for sample, res in run_samples(args.sources, samples, timeout, jobs,
+                                       ws):
             if report(sample, res, timeout, args.silent):
                 passed += 1
             else:

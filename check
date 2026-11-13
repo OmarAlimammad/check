@@ -168,7 +168,14 @@ def _received_at(path: Path) -> float:
 def log(msg: str, err: bool = False) -> None:
     # flush: the daemon's stdout is often a pipe or a log file, where output
     # would otherwise sit in a buffer instead of confirming the click.
-    print(f"[companion] {msg}", file=sys.stderr if err else sys.stdout, flush=True)
+    # Logging is best-effort: a listener started from a terminal that has since
+    # closed gets EIO here, and that must not stop the problem being cached
+    # (it used to abort _store between the .json and .last writes).
+    try:
+        print(f"[companion] {msg}", file=sys.stderr if err else sys.stdout,
+              flush=True)
+    except OSError:
+        pass
 
 
 class Listener:
